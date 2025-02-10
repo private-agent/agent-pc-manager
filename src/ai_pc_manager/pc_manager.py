@@ -41,14 +41,17 @@ class PCManager:
             end_idx = ai_response.find("COMPRESS_END:")
             compressed_content = ai_response[start_idx:end_idx].strip()
 
+            # 保留用户原始需求
+            user_input = self.conversation_history[0]
             # 清空历史并添加压缩后的内容
             self._clear_history()
             if compressed_content:
                 print("压缩后的内容：")
                 print(compressed_content)
+                self.conversation_history.append(user_input)
                 self.conversation_history.append({
                     "role": "assistant",
-                    "content": compressed_content
+                    "content": "以下是精简的对话历史：\n" + compressed_content
                 })
             return True
         return False
@@ -60,9 +63,9 @@ class PCManager:
                 async with aiohttp.ClientSession() as session:
                     payload = {
                         "messages": messages,
-                        "temperature": 0.0,
+                        "temperature": 0.5,
                         "stream": False,
-                        # "providers": ["siliconflow-deepseek-v3", "siliconflow-deepseek-r1-pro"]
+                        "providers": ["siliconflow-deepseek-r1-pro", "siliconflow-deepseek-v3"]
                     }
 
                     async with session.post(self.bash_url, json=payload) as response:
@@ -79,64 +82,94 @@ class PCManager:
             raise
 
     async def process_request(self, user_input: str) -> str:
-        """处理用户请求"""
-        self.conversation_history.append({
-            "role": "user",
-            "content": user_input
-        })
-
-        failed_times = 0
-
-        while True:
-            messages = [self._system_message] + self.conversation_history
-
-            ai_response = await self.get_ai_response(messages)
-
-            # 处理对话压缩
-            if self._handle_compression(ai_response):
-                continue
-
+        try:
+            """处理用户请求"""
             self.conversation_history.append({
-                "role": "assistant",
-                "content": ai_response
+                "role": "user",
+                "content": user_input
             })
-            # 处理命令执行
-            if "COMMAND:" in ai_response:
-                command_start = ai_response.find("COMMAND:") + 8
-                # 查找下一个换行符的位置
-                command_end = ai_response.find("\n", command_start) if "\n" in ai_response[command_start:] else len(ai_response)
-                command = ai_response[command_start:command_end].strip()
 
-                output, return_code = execute_command(command)
+            failed_times = 0
+
+            while True:
+                messages = [self._system_message] + self.conversation_history
+
+                ai_response = await self.get_ai_response(messages)
+
+                # 处理对话压缩
+                if self._handle_compression(ai_response):
+                    continue
+
                 self.conversation_history.append({
-                    "role": "user",
-                    "content": f"执行的命令：\n{command}\n" + \
-                        f"命令执行结果（返回码={return_code}）：\n{output}\n" + \
-                        ("\n提醒：请确保每个单独的命令结果符合期待再进行后续的操作，而不要盲目的使用管道连接多个命令！" if return_code != 0 else "")
+                    "role": "assistant",
+                    "content": ai_response
                 })
-                continue
+                # 处理命令执行
+                if "COMMAND:" in ai_response:
+                    command_start = ai_response.find("COMMAND:") + 8
+                    # 查找下一个换行符的位置
+                    def _find_enter_position(start_index):
+                        return ai_response.find("\n", start_index) if "\n" in ai_response[start_index:] else len(ai_response)
+                    command_end = _find_enter_position(command_start)
+                    while ai_response[command_end - 1] == "\\":
+                        command_end = _find_enter_position(command_end + 1)
+                    command = ai_response[command_start:command_end].strip()
 
-            def _handle_complete():
-                response = "\n=============================\n".join([message["content"] for message in self.conversation_history])
-                self._clear_history()  # 任务结束后清空历史
-                return response
+                    output, return_code = execute_command(command)
+                    self.conversation_history.append({
+                        "role": "user",
+                        "content": f"一轮对话仅执行一条命令：\n{command}\n" + \
+                            f"命令执行结果（返回码={return_code}）：\n{output}\n" + \
+                            ("\n提醒：请确保每个单独的命令结果符合期待再进行后续的操作，而不要盲目的使用管道连接多个命令！" if return_code != 0 else "")
+                    })
+                    continue
 
-            # 处理任务完成或失败
-            if "COMPLETE:" in ai_response:
-                return _handle_complete()
-            elif "FAILED:" in ai_response:
-                failed_times += 1
-                if failed_times >= self.FILED_RETRY_TIMES:
+                def _handle_complete():
+                    response = "\n=============================\n".join([message["content"] for message in self.conversation_history])
+                    self._clear_history()  # 任务结束后清空历史
+                    return response
+
+                # 处理任务完成或失败
+                if "COMPLETE:" in ai_response:
                     return _handle_complete()
+                elif "FAILED:" in ai_response:
+                    failed_times += 1
+                    if failed_times >= self.FILED_RETRY_TIMES:
+                        return _handle_complete()
+                    else:
+                        self.conversation_history.append({
+                            "role": "user",
+                            "content": f"请不要轻易放弃，请检查命令的返回是否符合期待，请检查请求的url是否正确等等。或再尝试其他方法。"
+                        })
+                        continue
                 else:
                     self.conversation_history.append({
                         "role": "user",
-                        "content": f"请不要轻易放弃，请检查命令的返回是否符合期待，请检查请求的url是否正确等等。或再尝试其他方法。"
+                        "content": f"AI响应格式错误，请严格遵循system提示词的响应格式规则并重试"
                     })
                     continue
-            else:
-                self.conversation_history.append({
-                    "role": "user",
-                    "content": f"AI响应格式错误，请严格遵循system提示词的响应格式规则并重试"
-                })
-                continue
+        except Exception as e:
+            logger.error(f"处理请求失败: {str(e)}")
+            raise e
+        finally:
+            self._clear_history()
+
+    async def __test(self):
+        """测试"""
+        self.conversation_history.append({
+            "role": "user",
+            "content": "你好"
+        })
+
+        messages = [{"role": "system", "content": "这是一个关于api对于多轮对话中的角色识别的测试。"},
+                    {"role": "user", "content": "1"},
+                    {"role": "assistant", "content": "2"},
+                    {"role": "user", "content": "3"},
+                    {"role": "assistant", "content": "4"},
+                    {"role": "user", "content": "5"},
+                    {"role": "assistant", "content": "6"},
+                    {"role": "user", "content": "请识别出对话中的角色，并返回角色的名称和对话内容。"},
+                    ]
+
+        ai_response = await self.get_ai_response(messages)
+        print(ai_response)
