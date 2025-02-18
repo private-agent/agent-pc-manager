@@ -65,7 +65,7 @@ class PCManager:
                         "messages": messages,
                         "temperature": 0.5,
                         "stream": False,
-                        "providers": ["siliconflow-deepseek-r1-pro", "siliconflow-deepseek-v3"]
+                        "model": "best"
                     }
 
                     async with session.post(self.bash_url, json=payload) as response:
